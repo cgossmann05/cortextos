@@ -1,5 +1,29 @@
-import { mkdirSync, rmdirSync, writeFileSync, readFileSync, rmSync } from 'fs';
+import { mkdirSync, rmdirSync, writeFileSync, readFileSync, rmSync, statSync } from 'fs';
 import { join } from 'path';
+
+// A lock dir older than this with a missing/corrupt/empty PID file is a crash
+// remnant — the holder never survived long enough to write a valid PID.
+// 30 s is orders of magnitude beyond any genuine mid-acquire window (~µs).
+const STALE_CORRUPT_LOCK_AGE_MS = 30_000;
+
+function isLockDirStale(lockDir: string): boolean {
+  try {
+    return (Date.now() - statSync(lockDir).mtimeMs) > STALE_CORRUPT_LOCK_AGE_MS;
+  } catch {
+    return false;
+  }
+}
+
+function stealLock(lockDir: string, pidFile: string): boolean {
+  try {
+    rmSync(lockDir, { recursive: true, force: true });
+    mkdirSync(lockDir);
+    writeFileSync(pidFile, String(process.pid));
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 /**
  * Acquire a mutex lock using mkdir (atomic on all filesystems).
@@ -34,16 +58,24 @@ export function acquireLock(dir: string): boolean {
     try {
       storedPidRaw = readFileSync(pidFile, 'utf-8').trim();
     } catch {
-      // PID file not yet written.  Holder is between mkdir and writeFileSync.
-      // Refuse the lock — the caller's retry loop will try again.
+      // PID file not yet written.  Two cases:
+      // (a) Holder is mid-acquire (between mkdir and writeFileSync) — µs window.
+      // (b) Holder crashed after mkdir but before writeFileSync — lock dir is old.
+      // Distinguish by age: if the dir is older than STALE_CORRUPT_LOCK_AGE_MS
+      // no genuine acquire takes that long, so it is safe to steal.
+      if (isLockDirStale(lockDir)) {
+        return stealLock(lockDir, pidFile);
+      }
       return false;
     }
 
     const storedPid = parseInt(storedPidRaw, 10);
     if (isNaN(storedPid) || storedPidRaw === '') {
-      // Corrupt PID file.  Don't steal — let caller retry; if it persists
-      // the holder is broken and a future stale-detection pass (process.kill
-      // check below, after the PID is written cleanly) will recover.
+      // Corrupt or empty PID file — holder crashed mid-write.
+      // Same age-based recovery: if the dir is old, it will never self-heal.
+      if (isLockDirStale(lockDir)) {
+        return stealLock(lockDir, pidFile);
+      }
       return false;
     }
 
