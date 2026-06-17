@@ -5,6 +5,8 @@ import { spawnSync } from 'child_process';
 import { join } from 'path';
 import { homedir } from 'os';
 import { ensureDir } from '../utils/atomic.js';
+import { updateHeartbeat } from '../bus/heartbeat.js';
+import { resolvePaths } from '../utils/paths.js';
 
 // Each fast-checker registers a process-level SIGUSR1 handler (see
 // fast-checker.ts:102). With >10 active agents the default Node listener cap
@@ -255,6 +257,14 @@ class Daemon {
         chmodSync(pidFile, 0o600);
       } catch { /* best effort */ }
     }
+
+    // Write an immediate startup heartbeat for the 'cortextos' pseudo-agent so
+    // read-all-heartbeats never shows it as STALE during the post-restart gap
+    // between daemon start and the first fast-checker watchdog ping (~50 min).
+    try {
+      const daemonPaths = resolvePaths('cortextos', this.instanceId, org);
+      updateHeartbeat(daemonPaths, 'cortextos', 'daemon started', { org });
+    } catch { /* non-fatal; watchdog will write a full heartbeat on first ping */ }
 
     // Create agent manager
     this.agentManager = new AgentManager(this.instanceId, this.ctxRoot, frameworkRoot, org);
